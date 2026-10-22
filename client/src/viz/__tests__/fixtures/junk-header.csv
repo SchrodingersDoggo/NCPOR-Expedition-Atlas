@@ -1,0 +1,7 @@
+Sea-Bird SBE sample export
+Cruise: TEST-26
+Generated for instrument QA
+Depth (m),Temperature (C),Salinity (PSU)
+0,2.3,34.8
+10,1.9,34.9
+20,1.5,35.0

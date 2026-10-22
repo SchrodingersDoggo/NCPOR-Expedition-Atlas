@@ -1,0 +1,18 @@
+{
+  "name": "NCPOR Expedition Atlas",
+  "short_name": "NCPOR Atlas",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#071620",
+  "theme_color": "#071620",
+  "description": "Offline-capable NCPOR expedition research portal",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

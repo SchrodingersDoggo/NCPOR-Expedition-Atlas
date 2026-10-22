@@ -1,0 +1,12 @@
+* Sea-Bird SBE 19plus Data File:
+* NMEA Latitude = 66 30.000 S
+* NMEA Longitude = 038 12.000 E
+# start_time = Sep 25 2026 12:00:00
+# bad_flag = -9.990e-29
+# name 0 = prDM: Pressure, Digiquartz [db]
+# name 1 = t090C: Temperature [ITS-90, deg C]
+# name 2 = sal00: Salinity [PSU]
+*END*
+0.0 -1.20 34.80
+10.0 -1.35 34.85
+20.0 -9.990e-29 34.90

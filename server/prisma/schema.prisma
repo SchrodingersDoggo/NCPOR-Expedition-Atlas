@@ -1,0 +1,1009 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  admin
+  comms_officer
+  researcher
+  public
+}
+
+enum Region {
+  Arctic
+  Antarctic
+  Himalaya
+  Southern_Ocean
+  Other
+}
+
+// Phase 3 (Emergency Alert): a coarse, at-a-glance danger status per
+// expedition/location. Every new alert bumps this up exactly one step;
+// only a manual resolve (Phase 5) brings it back down.
+enum DangerLevel {
+  low
+  moderate
+  high
+  critical
+}
+
+enum ContentType {
+  report
+  dataset
+  publication
+  photo
+  video
+  activity
+}
+
+enum ContentStatus {
+  draft
+  in_review
+  published
+  archived
+}
+
+// Dataset access control (separate from ContentStatus, which governs
+// scientific-content review/publication, not who may download the file
+// once published).
+enum DatasetAccessLevel {
+  open             // Guest (anyone, logged in or not) can access
+  registered       // any active logged-in user can access
+  request_required // must file a DatasetAccessRequest and be approved
+  restricted       // only explicitly authorized users/staff can access
+}
+
+enum AccessRequestStatus {
+  pending
+  approved
+  rejected
+}
+
+enum GenerationType {
+  web_summary
+  social_caption_twitter
+  social_caption_instagram
+  alt_text
+  hashtags
+}
+
+enum Platform {
+  twitter
+  instagram
+  linkedin
+  facebook
+}
+
+enum PostStatus {
+  queued
+  posted
+  failed
+}
+
+// Archive module (Phase 6) — research domain classification used for
+// Advanced Filters and for scoring Related Content matches.
+enum ResearchDomain {
+  climate_science
+  glaciology
+  oceanography
+  atmospheric_science
+  geology
+  biology_ecology
+  other
+}
+
+// --- Dataset Metadata (NPDC parity) ---------------------------------------
+// Metadata-first workflow, matching how the real National Polar Data Center
+// portal works: a researcher can describe a dataset and save that
+// description before any actual/processed data file exists. The file
+// (ContentItem) is optional and may be attached later, or never.
+
+enum MetadataStatus {
+  draft             // being filled in, not yet handed to anyone for review
+  submitted         // researcher has submitted it; awaiting review
+  under_review      // a comms_officer/admin has started reviewing it
+  changes_requested // reviewer sent it back with a required comment
+  approved          // reviewed and accepted, not yet public
+  published         // publicly discoverable, on the Archive
+  archived          // retired from the Archive, kept for the record
+}
+
+enum ProcessingLevel {
+  raw
+  processed
+  calibrated
+  derived
+}
+
+// Physical storage backing a ContentItem. Existing records remain on
+// Cloudinary; only the dedicated scientific-dataset multipart flow uses
+// MinIO.
+enum StorageProvider {
+  cloudinary
+  minio
+}
+
+// Shared storage lifecycle vocabulary. Existing ContentItem rows are
+// already uploaded assets, so their default is `completed`. Multipart
+// sessions use the earlier states while bytes are still being transferred.
+enum StorageUploadStatus {
+  initiated
+  uploading
+  completed
+  aborted
+  failed
+}
+
+model DatasetMetadata {
+  id          String  @id @default(uuid())
+  title       String
+  description String?
+
+  // Linkage — metadata-first. One metadata record can now carry many files
+  // (raw, processed, documentation, calibration, derived...), so the file
+  // link moved out into its own DatasetFile join row instead of a single
+  // contentItemId column here. A record with zero DatasetFile rows is
+  // still a fully valid, describable, discoverable record — the "metadata
+  // exists before any file does" case is unaffected by this change.
+  expeditionId  String?     @map("expedition_id")
+  expedition    Expedition? @relation(fields: [expeditionId], references: [id])
+  files         DatasetFile[]
+
+  // Who — PI credited on the dataset vs. whoever actually filed the record
+  // (often the same person, not always — see the User model comment).
+  principalInvestigator String? @map("principal_investigator")
+  pi                     User?  @relation("MetadataPI", fields: [principalInvestigator], references: [id])
+  institution             String? @default("NCPOR")
+
+  // Where — region stays the broad NPDC-style classification (Antarctic /
+  // Arctic / Southern Ocean / Himalaya / Other); station is the specific,
+  // controlled research location within it (region -> station -> lat/lng),
+  // e.g. region Antarctic -> station Maitri. exactLocation remains for
+  // free-text detail a fixed station list can't capture ("50m from the
+  // Maitri met tower") and stays independent of which station is picked.
+  region        Region?
+  stationId     String?  @map("station_id")
+  station       Station? @relation(fields: [stationId], references: [id])
+  exactLocation String?  @map("exact_location")
+  latitude      Decimal? @db.Decimal(9, 6)
+  longitude     Decimal? @db.Decimal(9, 6)
+
+  // When — the observation period the data covers, not when it was typed in.
+  observationStart DateTime? @map("observation_start") @db.Date
+  observationEnd   DateTime? @map("observation_end") @db.Date
+
+  // Scientific classification
+  discipline       ResearchDomain?  @map("discipline")
+  keywords         String[]        @map("keywords")
+  parameters       String[]        @map("parameters")
+  instrumentMethod String?         @map("instrument_method")
+  processingLevel  ProcessingLevel? @map("processing_level")
+
+  // Access / provenance / format
+  accessConditions String? @map("access_conditions")
+  citation         String?
+  fileFormat       String? @map("file_format")
+  units            String?
+
+  // Lifecycle
+  status      MetadataStatus @default(draft)
+  submittedAt DateTime?      @map("submitted_at")
+
+  // Idempotency, matching the clientRequestId pattern used everywhere
+  // else in this app (Expedition, ContentItem, Alert) so a retried
+  // submission after a lost response can't create a duplicate record.
+  clientRequestId String? @unique @map("client_request_id")
+
+  createdBy String   @map("created_by")
+  creator   User     @relation("MetadataCreatedBy", fields: [createdBy], references: [id])
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  reviewHistory MetadataReviewHistory[]
+
+  @@index([status])
+  @@index([expeditionId])
+  @@index([discipline])
+  @@index([stationId])
+  @@map("dataset_metadata")
+}
+
+// One row per review action taken on a DatasetMetadata record — Start
+// Review, Request Changes, Approve, Publish, Archive, and a researcher's
+// resubmission after changes were requested. This is a durable audit log,
+// never edited or deleted, distinct from the record's own current
+// status/submittedAt fields, which only ever hold the latest state.
+model MetadataReviewHistory {
+  id         String   @id @default(uuid())
+  metadataId String   @map("metadata_id")
+  metadata   DatasetMetadata @relation(fields: [metadataId], references: [id], onDelete: Cascade)
+
+  // Null for a researcher's own resubmission action — that's not "review"
+  // activity, but belongs in the same timeline so the back-and-forth reads
+  // as one continuous history rather than two disjoint logs.
+  reviewerId String? @map("reviewer_id")
+  reviewer   User?   @relation("MetadataReviewedBy", fields: [reviewerId], references: [id])
+
+  action    String // start_review | request_changes | approve | publish | archive | resubmit
+  comment   String? // required by the API specifically for request_changes; optional otherwise
+  oldStatus MetadataStatus @map("old_status")
+  newStatus MetadataStatus @map("new_status")
+  createdAt DateTime       @default(now()) @map("created_at")
+
+  @@index([metadataId, createdAt])
+  @@map("metadata_review_history")
+}
+
+// Controlled research-location vocabulary: region -> station -> coordinates.
+// Admin-managed (create/update/delete are admin/comms_officer-only, same
+// governance as the Tag/keyword vocabulary, though stations don't need a
+// pending/approved workflow the way researcher-suggested keywords do —
+// only staff can create one in the first place). Matches NPDC's own
+// "Browse by Location" drill-down: pick a region, see its stations, each
+// with a real coordinate and a dataset count.
+model Station {
+  id          String   @id @default(uuid())
+  name        String
+  region      Region
+  latitude    Decimal  @db.Decimal(9, 6)
+  longitude   Decimal  @db.Decimal(9, 6)
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  datasetMetadata DatasetMetadata[]
+
+  @@unique([name, region])
+  @@index([region])
+  @@map("stations")
+}
+
+// What kind of file this is, relative to the dataset it belongs to. Lets
+// one DatasetMetadata record hold the full lifecycle of a scientific
+// observation — the raw sensor dump, the QC'd/processed version,
+// documentation (a PDF methodology note, a cruise report excerpt),
+// calibration records, and a derived product added months later.
+enum FileRole {
+  raw
+  processed
+  documentation
+  calibration
+  derived
+  other
+}
+
+// One row per attached file. contentItemId is unique because a given
+// upload (Cloudinary asset + ContentItem row) belongs to exactly one
+// DatasetFile slot — but a single DatasetMetadata record can own many
+// DatasetFile rows, which is the actual "one metadata, many files" link.
+model DatasetFile {
+  id                String          @id @default(uuid())
+  datasetMetadataId String          @map("dataset_metadata_id")
+  datasetMetadata   DatasetMetadata @relation(fields: [datasetMetadataId], references: [id], onDelete: Cascade)
+  contentItemId     String          @unique @map("content_item_id")
+  content           ContentItem     @relation(fields: [contentItemId], references: [id], onDelete: Cascade)
+  role              FileRole        @default(raw)
+  // Free-text label for when "role" alone doesn't disambiguate — e.g. two
+  // "raw" files from different instruments on the same cast.
+  label             String?
+  createdAt         DateTime        @default(now()) @map("created_at")
+
+  @@index([datasetMetadataId])
+  @@index([role])
+  @@map("dataset_files")
+}
+
+enum AccountStatus {
+  pending
+  active
+  suspended
+  rejected
+}
+
+model User {
+  id           String   @id @default(uuid())
+  // Kept as the single display name used everywhere else in this app
+  // (uploader bylines, PI credits, expedition leads...) — populated from
+  // firstName + lastName at registration so none of that existing code
+  // needs to change. firstName/lastName/etc. below are the NPDC-style
+  // fields captured at registration; name stays the derived, stable one.
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role     @default(researcher)
+  organization String   @default("NCPOR")
+  avatarUrl    String?  @map("avatar_url")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  // Account approval workflow (separate from scientific-content approval —
+  // this gates login-and-act, not any dataset/metadata status). Existing
+  // rows (seed/demo accounts) default to 'active' so nothing already
+  // working gets locked out; the register endpoint explicitly overrides
+  // this to 'pending' for every new self-registration.
+  accountStatus AccountStatus @default(active) @map("account_status")
+  approvedBy    String?       @map("approved_by")
+  approver      User?         @relation("AccountApprovedBy", fields: [approvedBy], references: [id])
+  approvedUsers User[]        @relation("AccountApprovedBy")
+  approvedAt    DateTime?     @map("approved_at")
+
+  // NPDC-style registration fields (Section 1.4 of the user guidelines) —
+  // all optional at the database level so nothing here breaks for an
+  // existing account created before these fields existed; the register
+  // endpoint requires the non-optional ones for a brand-new signup.
+  title                String?   @map("title")
+  firstName            String?   @map("first_name")
+  lastName             String?   @map("last_name")
+  preferredName        String?   @map("preferred_name")
+  designation          String?   @map("designation")
+  organisationWebsite  String?   @map("organisation_website")
+  personalProfileUrl   String?   @map("personal_profile_url")
+  communicationAddress String?   @map("communication_address")
+  alternateEmail       String?   @map("alternate_email")
+  mobileNumber         String?   @map("mobile_number")
+
+  // Public contact links shown on the researcher / community profile
+  // (Communities update). All optional; email/mobile stay private unless
+  // the user explicitly opts in with showEmail / showMobile.
+  linkedinUrl     String?  @map("linkedin_url")
+  twitterUrl      String?  @map("twitter_url")
+  researchGateUrl String?  @map("researchgate_url")
+  orcidId         String?  @map("orcid_id")
+  githubUrl       String?  @map("github_url")
+  bio             String?  @map("bio")
+  showEmail       Boolean  @default(false) @map("show_email")
+  showMobile      Boolean  @default(false) @map("show_mobile")
+
+  expeditionsLed  Expedition[]    @relation("PrincipalInvestigator")
+  contentUploaded ContentItem[]   @relation("UploadedBy")
+  contentApproved ContentItem[]   @relation("ApprovedBy")
+  aiReviewed      AiGeneration[]  @relation("ReviewedBy")
+  activities      Activity[]
+  alertsReported  Alert[]         @relation("AlertReporter")
+  alertsResolved  Alert[]         @relation("AlertResolver")
+  studioProjects  StudioProject[]
+  datasetUploadSessions DatasetUploadSession[]
+
+  // Dataset Metadata (NPDC-parity) — a User can be the PI credited on a
+  // metadata record, and/or the person who actually typed the form in.
+  // Kept as two separate relations because those are very often different
+  // people (a comms_officer cataloguing an older PI's cruise, for example).
+  metadataAsPI   DatasetMetadata[] @relation("MetadataPI")
+  metadataFiled  DatasetMetadata[] @relation("MetadataCreatedBy")
+
+  // Controlled Scientific Keywords vocabulary — a researcher's suggestions
+  // vs. an admin's approve/reject decisions (see Tag model).
+  tagSuggestions Tag[] @relation("TagSuggestedBy")
+  tagReviews     Tag[] @relation("TagReviewedBy")
+
+  // Scientific metadata review actions this user has taken (Start Review,
+  // Request Changes, Approve, Publish, Archive) — see MetadataReviewHistory.
+  metadataReviewActions MetadataReviewHistory[] @relation("MetadataReviewedBy")
+
+  // Dataset access requests (request_required / restricted datasets) — a
+  // user's own requests vs. a staff member's review decisions.
+  accessRequestsMade     DatasetAccessRequest[] @relation("AccessRequestedBy")
+  accessRequestsReviewed DatasetAccessRequest[] @relation("AccessReviewedBy")
+
+  // Activities + Community (SIH update)
+  observations          PolarObservation[]
+  communityMemberships  CommunityMembership[]
+  communityPosts        CommunityPost[]
+  communityComments     CommunityComment[]
+  communityLikes        CommunityPostLike[]
+
+  // Communities (Reddit-style) update
+  communitiesCreated    CommunityCircle[]      @relation("CommunityCreator")
+  communityPostVotes    CommunityPostVote[]
+  communityCommentVotes CommunityCommentVote[]
+  notifications         Notification[]         @relation("NotificationRecipient")
+  notificationsCaused   Notification[]         @relation("NotificationActor")
+
+  // Direct messages
+  messagesSent     DirectMessage[] @relation("MessageSender")
+  messagesReceived DirectMessage[] @relation("MessageReceiver")
+
+  @@map("users")
+}
+
+enum DangerType {
+  medical
+  weather
+  terrain_ice
+  equipment_vehicle
+  other
+}
+
+// Phase 1 of the Emergency Alert feature: a field team member reports a
+// danger against an expedition/location. This is intentionally just a
+// record of what happened — it does not yet touch the expedition's overall
+// danger level (that's Phase 3) or notify anyone in real time (Phase 2).
+model Alert {
+  id           String     @id @default(uuid())
+  expeditionId String     @map("expedition_id")
+  expedition   Expedition @relation(fields: [expeditionId], references: [id])
+  type         DangerType
+  message      String?
+  reportedBy   String?    @map("reported_by")
+  reporter     User?      @relation("AlertReporter", fields: [reportedBy], references: [id])
+  latitude     Decimal?   @db.Decimal(9, 6)
+  longitude    Decimal?   @db.Decimal(9, 6)
+  resolved     Boolean    @default(false)
+  // Phase 5: who cleared it and when. Only ever set by an admin/comms_officer
+  // manually resolving — there is no automatic time-based decay.
+  resolvedBy   String?    @map("resolved_by")
+  resolver     User?      @relation("AlertResolver", fields: [resolvedBy], references: [id])
+  resolvedAt   DateTime?  @map("resolved_at")
+  // Retrying a report after a lost response (weak field connection) must not
+  // create a duplicate alert — same idempotency pattern as Expedition/ContentItem.
+  clientRequestId String? @unique @map("client_request_id")
+  createdAt    DateTime   @default(now()) @map("created_at")
+
+  @@index([expeditionId])
+  @@index([resolved])
+  @@map("alerts")
+}
+
+model Expedition {
+  id                    String    @id @default(uuid())
+  name                  String
+  region                Region?
+  description           String?
+  startDate             DateTime? @map("start_date") @db.Date
+  endDate               DateTime? @map("end_date") @db.Date
+  latitude              Decimal?  @db.Decimal(9, 6)
+  longitude             Decimal?  @db.Decimal(9, 6)
+  principalInvestigator String?   @map("principal_investigator")
+  clientRequestId      String?   @unique @map("client_request_id")
+  pi                    User?     @relation("PrincipalInvestigator", fields: [principalInvestigator], references: [id])
+  createdAt             DateTime  @default(now()) @map("created_at")
+  // Phase 7: optimistic concurrency. An offline edit carries the timestamp it
+  // was based on; if the server has moved on since, the PATCH is refused with
+  // 409 instead of overwriting whatever changed in the meantime.
+  updatedAt             DateTime  @default(now()) @updatedAt @map("updated_at")
+  lastEditRequestId      String?   @unique @map("last_edit_request_id")
+  // Phase 3: current at-a-glance danger status, escalated by incoming
+  // alerts and only reduced by an explicit resolve (Phase 5).
+  dangerLevel            DangerLevel @default(low) @map("danger_level")
+
+  // Voyage identity (NPDC's "Scientific Voyage Details" distinguishes a
+  // voyage/cruise by ship name and voyage name, e.g. ship "ORV Sagar
+  // Kanya", voyage "ISOE-14" — separate from `name`, which is this
+  // expedition's own display/public title and may not match either).
+  // All voyage/cruise fields below are optional and intentionally left
+  // blank for Antarctic land expeditions and anything else that isn't a
+  // ship voyage — startDate/endDate above still serve as the general
+  // departure/return dates for every expedition, land or sea.
+  shipName       String? @map("ship_name")
+  voyageName     String? @map("voyage_name")
+  // The descriptive program/cruise name, distinct from voyageName —
+  // NPDC's own table shows both for the same row, e.g. voyage "ISOE-9"
+  // under cruise "Indian Southern Ocean Expedition (ISOE)".
+  cruiseName     String? @map("cruise_name")
+  // NPDC's "Cruise No" (e.g. "SK-367") — a ship's own cruise numbering,
+  // separate from voyageName which identifies the broader expedition.
+  cruiseNumber   String? @map("cruise_number")
+  // The sea area/route covered (NPDC's "Cruise Area", e.g. "Arabian Sea").
+  routeArea      String? @map("route_area")
+  // Named stations/ports called at during the voyage (e.g. "Maitri",
+  // "Bharati") — plain list, not a foreign key, since a station here is
+  // just a label on this voyage, not itself a browsable entity yet.
+  stationsVisited String[] @default([]) @map("stations_visited")
+
+  contentItems     ContentItem[]
+  alerts           Alert[]
+  datasetMetadata  DatasetMetadata[]
+
+  // Activities + Community (SIH update)
+  observations     PolarObservation[]
+  communityPosts   CommunityPost[]
+
+  @@map("expeditions")
+}
+
+// Durable control-plane state for a direct browser -> MinIO multipart
+// dataset transfer. No file bytes are stored here; this only records who owns
+// the upload and the exact multipart geometry the backend must enforce.
+model DatasetUploadSession {
+  id             String              @id @default(uuid())
+  userId         String              @map("user_id")
+  user           User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  uploadId       String              @unique @map("upload_id")
+  objectKey      String              @unique @map("object_key")
+  fileName       String              @map("file_name")
+  fileSize       BigInt              @map("file_size")
+  mimeType       String              @map("mime_type")
+  partSize       BigInt              @map("part_size")
+  status         StorageUploadStatus @default(initiated)
+  etag           String?
+  checksumSha256 String?             @map("checksum_sha256")
+  // True SHA-256 of the complete source file, calculated incrementally in
+  // the browser worker. Keep separate from MinIO/S3 multipart checksums,
+  // which may be composite checksums rather than sha256(fileBytes).
+  wholeFileSha256 String?            @map("whole_file_sha256")
+  // Null for pre-Phase-7 in-progress uploads so they can finish unchanged.
+  // New multipart sessions use SHA256 and require a checksum for every part.
+  checksumAlgorithm String?          @map("checksum_algorithm")
+  versionId      String?             @map("version_id")
+  completedAt    DateTime?           @map("completed_at")
+  abortedAt      DateTime?           @map("aborted_at")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @default(now()) @updatedAt @map("updated_at")
+
+  @@index([userId, status])
+  @@index([createdAt])
+  @@map("dataset_upload_sessions")
+}
+
+model ContentItem {
+  id             String        @id @default(uuid())
+  expeditionId   String?       @map("expedition_id")
+  clientRequestId String?       @unique @map("client_request_id")
+  expedition     Expedition?   @relation(fields: [expeditionId], references: [id])
+  type           ContentType
+  title          String
+  description    String?
+  // Cloudinary items keep their existing URL. MinIO objects are private and
+  // therefore store an object key instead of a permanent/presigned URL.
+  fileUrl          String?             @map("file_url")
+  storageProvider  StorageProvider     @default(cloudinary) @map("storage_provider")
+  objectKey        String?             @unique @map("object_key")
+  originalFileName String?             @map("original_file_name")
+  checksumSha256   String?             @map("checksum_sha256")
+  wholeFileSha256  String?             @map("whole_file_sha256")
+  uploadStatus     StorageUploadStatus @default(completed) @map("upload_status")
+  thumbnailUrl   String?       @map("thumbnail_url")
+  fileSizeBytes  BigInt?       @map("file_size_bytes")
+  mimeType       String?       @map("mime_type")
+  status         ContentStatus @default(draft)
+  // Dataset access control — default 'open' so every existing/ordinary
+  // item behaves exactly as before; only a dataset explicitly marked
+  // otherwise gates its fileUrl behind a DatasetAccessRequest (see that
+  // model). Not restricted to type: 'dataset' at the schema level, in case
+  // a sensitive report ever needs the same gating, but the UI only offers
+  // choosing this for datasets, per the spec.
+  accessLevel    DatasetAccessLevel @default(open) @map("access_level")
+  accessRequests DatasetAccessRequest[]
+  // Full long-form write-up (rich text, stored as HTML) — the "article"
+  // itself, as opposed to `description` which is a one/two-line caption.
+  body           String?
+  // AI-generated (then optionally human-edited) summary — kept separate
+  // from `description` so generating one doesn't clobber a caption someone
+  // already wrote by hand.
+  summary        String?
+  // Computed once, client-side, when a researcher uploads/builds a dataset
+  // (type = "dataset"): { row_count, columns: [{name,type}], preview_rows }.
+  // Null for every other content type. See parseDataset.js on the client.
+  datasetMeta    Json?         @map("dataset_meta")
+  uploadedBy     String?       @map("uploaded_by")
+  uploader       User?         @relation("UploadedBy", fields: [uploadedBy], references: [id])
+  approvedBy     String?       @map("approved_by")
+  approver       User?         @relation("ApprovedBy", fields: [approvedBy], references: [id])
+  viewCount      Int           @default(0) @map("view_count")
+  downloadCount  Int           @default(0) @map("download_count")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @default(now()) @updatedAt @map("updated_at")
+
+  // --- Archive module (Phase 6) ----------------------------------------
+  // Region this item belongs to for archive search/filtering/timeline.
+  // Independent of expedition.region so photos/reports/activities that
+  // aren't attached to an expedition can still be located by region.
+  region         Region?         @map("region")
+  // Free-text classification used by Advanced Filters and Related Content
+  // scoring. Kept optional/free-form rather than a rigid enum-only field
+  // so archivists aren't blocked cataloguing older material.
+  researchDomain ResearchDomain? @map("research_domain")
+  // Author/researcher credit line — separate from `uploadedBy` because the
+  // person cataloguing an item (e.g. a comms_officer) is often not the
+  // original author of an old expedition report.
+  authors        String?         @map("authors")
+  // Where the item originally came from (e.g. "43rd ISEA field team",
+  // "NCPOR data cell") for material that predates this portal.
+  source         String?         @map("source")
+  // The year this material is archived under on the Year Timeline —
+  // defaults to the expedition's start year or the upload year, but can
+  // be set explicitly so scanned/legacy material keeps its real year.
+  year           Int?            @map("archive_year")
+  // Manual queue ordering for the Submission Queue — higher sorts first
+  // within a given status when "Priority" ordering is selected. 0 for
+  // everything by default, so the queue falls back to submission date.
+  priority       Int             @default(0) @map("priority")
+
+  tags          ContentTag[]
+  aiGenerations AiGeneration[]
+
+  // Opposite side of DatasetFile.contentItemId — present only once this
+  // content item has actually been attached to a metadata record as one
+  // of its files (raw/processed/documentation/calibration/derived). Most
+  // content items (reports, photos, videos, and anything not part of the
+  // metadata-first flow) will have this null forever, which is expected.
+  datasetFileLink DatasetFile?
+
+  @@index([status])
+  @@index([expeditionId])
+  @@index([year])
+  @@index([region])
+  @@index([researchDomain])
+  @@index([type, status])
+  @@map("content_items")
+}
+
+// Controlled vocabulary for Scientific Keywords: any brand-new keyword a
+// researcher types becomes a 'pending' suggestion rather than being usable
+// immediately — it still tags their own item, but it won't appear in the
+// public "Browse by Scientific Keywords" facet or filter until a
+// comms_officer/admin approves it. Keeps filtering/analytics clean the way
+// a free-for-all tag list never would, while still letting researchers
+// propose terms the admin list hasn't caught up with yet.
+enum TagStatus {
+  pending
+  approved
+  rejected
+}
+
+model Tag {
+  id     Int       @id @default(autoincrement())
+  name   String    @unique
+  status TagStatus @default(pending)
+
+  // Who proposed it (a researcher, on first use) vs. who accepted/declined
+  // it (a comms_officer/admin) — usually different people, sometimes the
+  // same when an admin adds a term directly (created pre-approved).
+  suggestedBy String? @map("suggested_by")
+  suggester   User?   @relation("TagSuggestedBy", fields: [suggestedBy], references: [id])
+  reviewedBy  String? @map("reviewed_by")
+  reviewer    User?   @relation("TagReviewedBy", fields: [reviewedBy], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  items ContentTag[]
+
+  @@index([status])
+  @@map("tags")
+}
+
+model ContentTag {
+  contentItemId String @map("content_item_id")
+  tagId         Int    @map("tag_id")
+
+  content ContentItem @relation(fields: [contentItemId], references: [id], onDelete: Cascade)
+  tag     Tag         @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([contentItemId, tagId])
+  @@map("content_tags")
+}
+
+model AiGeneration {
+  id                String         @id @default(uuid())
+  contentItemId     String?        @map("content_item_id")
+  content           ContentItem?   @relation(fields: [contentItemId], references: [id], onDelete: Cascade)
+  generationType    GenerationType @map("generation_type")
+  aiOutput          String         @map("ai_output")
+  editedOutput      String?        @map("edited_output")
+  isPublished       Boolean        @default(false) @map("is_published")
+  version           Int            @default(1)
+  generatedByModel  String?        @map("generated_by_model")
+  reviewedBy        String?        @map("reviewed_by")
+  reviewer          User?          @relation("ReviewedBy", fields: [reviewedBy], references: [id])
+  createdAt         DateTime       @default(now()) @map("created_at")
+
+  socialPosts SocialPost[]
+
+  @@map("ai_generations")
+}
+
+model Activity {
+  id           String    @id @default(uuid())
+  title        String
+  description  String?
+  activityDate DateTime? @map("activity_date") @db.Date
+  status       String    @default("draft")
+  // Institutional-activity fields (SIH Activities+Community update) — all
+  // optional so a plain title/description activity still works without
+  // them.
+  location     String?
+  startTime    DateTime? @map("start_time")
+  endTime      DateTime? @map("end_time")
+  organizer    String?
+  activityType String    @default("institutional_event") @map("activity_type")
+  createdBy    String?   @map("created_by")
+  creator      User?     @relation(fields: [createdBy], references: [id])
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([activityDate])
+  @@index([status])
+  @@map("activities")
+}
+
+// --- Activities + Community (SIH update) -----------------------------------
+
+model PolarObservation {
+  id              String      @id @default(uuid())
+  title           String
+  observationType String      @map("observation_type")
+  description     String
+  region          Region?
+  latitude        Decimal?    @db.Decimal(9, 6)
+  longitude       Decimal?    @db.Decimal(9, 6)
+  observedAt      DateTime    @map("observed_at")
+  confidence      String      @default("unverified")
+  status          String      @default("submitted")
+  evidenceUrl     String?     @map("evidence_url")
+  expeditionId    String?     @map("expedition_id")
+  expedition      Expedition? @relation(fields: [expeditionId], references: [id], onDelete: SetNull)
+  createdBy       String      @map("created_by")
+  creator         User        @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+
+  @@index([createdAt])
+  @@index([status])
+  @@index([region])
+  @@index([expeditionId])
+  @@map("polar_observations")
+}
+
+model CommunityCircle {
+  id          String   @id @default(uuid())
+  slug        String   @unique
+  name        String
+  description String
+  topic       String
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  // Communities update — Reddit-style community types:
+  //   public     anyone can view, any member can post
+  //   restricted anyone can view/comment, only approved members can post
+  //   private    only approved members can view or participate
+  type      String  @default("public")
+  rules     Json?
+  iconColor String? @map("icon_color")
+  bannerColor String? @map("banner_color")
+  createdBy String? @map("created_by")
+  creator   User?   @relation("CommunityCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+
+  memberships CommunityMembership[]
+  posts       CommunityPost[]
+
+  @@map("community_circles")
+}
+
+model CommunityMembership {
+  userId   String   @map("user_id")
+  circleId String   @map("circle_id")
+  joinedAt DateTime @default(now()) @map("joined_at")
+  // member | moderator
+  role     String   @default("member")
+  // active | pending (join request awaiting a moderator)
+  status   String   @default("active")
+  favorite Boolean  @default(false)
+
+  user   User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  circle CommunityCircle @relation(fields: [circleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, circleId])
+  @@index([circleId])
+  @@index([userId, status])
+  @@map("community_memberships")
+}
+
+model CommunityPost {
+  id           String           @id @default(uuid())
+  title        String
+  body         String
+  tags         Json?
+  status       String           @default("published")
+  verified     Boolean          @default(false)
+  createdBy    String           @map("created_by")
+  creator      User             @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  circleId     String?          @map("circle_id")
+  circle       CommunityCircle? @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  expeditionId String?          @map("expedition_id")
+  expedition   Expedition?      @relation(fields: [expeditionId], references: [id], onDelete: SetNull)
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  // Communities update: text | media | link | news
+  postType String  @default("text") @map("post_type")
+  linkUrl  String? @map("link_url")
+  // [{ url, type: 'image'|'video', thumbnailUrl, width, height }]
+  media    Json?
+  score    Int     @default(0)
+
+  comments CommunityComment[]
+  likes    CommunityPostLike[]
+  votes    CommunityPostVote[]
+
+  @@index([createdAt])
+  @@index([circleId])
+  @@index([postType, createdAt])
+  @@index([score])
+  @@index([expeditionId])
+  @@map("community_posts")
+}
+
+model CommunityComment {
+  id        String   @id @default(uuid())
+  postId    String   @map("post_id")
+  userId    String   @map("user_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Communities update — threaded replies + votes
+  parentId String?            @map("parent_id")
+  parent   CommunityComment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies  CommunityComment[] @relation("CommentReplies")
+  score    Int                @default(0)
+  deleted  Boolean            @default(false)
+  votes    CommunityCommentVote[]
+
+  post CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt])
+  @@index([parentId])
+  @@map("community_comments")
+}
+
+model CommunityPostLike {
+  postId    String   @map("post_id")
+  userId    String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@index([userId])
+  @@map("community_post_likes")
+}
+
+// --- Communities (Reddit-style) update -------------------------------------
+
+model CommunityPostVote {
+  postId    String   @map("post_id")
+  userId    String   @map("user_id")
+  // +1 upvote, -1 downvote
+  value     Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post CommunityPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  @@index([userId])
+  @@map("community_post_votes")
+}
+
+model CommunityCommentVote {
+  commentId String   @map("comment_id")
+  userId    String   @map("user_id")
+  value     Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  comment CommunityComment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  user    User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([commentId, userId])
+  @@index([userId])
+  @@map("community_comment_votes")
+}
+
+// In-app notifications for the Communities area (bell icon).
+// type: post_comment | comment_reply | join_request | join_approved | new_post_in_moderated
+model Notification {
+  id          String    @id @default(uuid())
+  userId      String    @map("user_id")
+  user        User      @relation("NotificationRecipient", fields: [userId], references: [id], onDelete: Cascade)
+  actorId     String?   @map("actor_id")
+  actor       User?     @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+  type        String
+  title       String
+  link        String?
+  readAt      DateTime? @map("read_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// Private 1:1 direct messages (REST + polling, text only).
+model DirectMessage {
+  id         String    @id @default(uuid())
+  senderId   String    @map("sender_id")
+  sender     User      @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiverId String    @map("receiver_id")
+  receiver   User      @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  body       String
+  readAt     DateTime? @map("read_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([senderId, receiverId, createdAt])
+  @@index([receiverId, readAt])
+  @@map("direct_messages")
+}
+
+model SocialPost {
+  id             String        @id @default(uuid())
+  aiGenerationId String?       @map("ai_generation_id")
+  aiGeneration   AiGeneration? @relation(fields: [aiGenerationId], references: [id])
+  platform       Platform?
+  scheduledFor   DateTime?     @map("scheduled_for")
+  status         PostStatus    @default(queued)
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  @@map("social_posts")
+}
+
+
+// Researcher-only short-form media workspace. Source assets stay in Cloudinary;
+// AI/edit/render metadata is persisted here so a render survives refresh/redeploy.
+model StudioProject {
+  id              String   @id @default(uuid())
+  title           String
+  notes           String?
+  sourceVideos    Json     @map("source_videos")
+  sourceData      Json?    @map("source_data")
+  // Photos a researcher uploaded directly (not a video) — used either as a
+  // reference for the AI to restyle into a social-ready image, or just
+  // stored for provenance when there's a video too.
+  sourceImages    Json?    @map("source_images")
+  editPlan        Json?    @map("edit_plan")
+  caption         String?
+  aiSummary       String?  @map("ai_summary")
+  voiceoverScript String?  @map("voiceover_script")
+  voiceoverUrl    String?  @map("voiceover_url")
+  // Which voiceover language/style the researcher picked — a code like
+  // 'en', 'hi', or a blend like 'hinglish'. Null/'en' behaves as before.
+  voiceoverLanguage String? @map("voiceover_language")
+  renderId        String?  @map("render_id")
+  renderStatus    String?  @map("render_status")
+  // Random per-project secret, generated when a render starts, embedded as
+  // a query param in the webhook URL we hand to Creatomate. Creatomate's
+  // webhook calls aren't signed (no HMAC/shared-secret mechanism on their
+  // side), so this is what actually proves a callback is genuine — it's
+  // never included in any API response to the client, only ever sent to
+  // Creatomate itself as part of the callback URL.
+  webhookToken    String?  @map("webhook_token")
+  reelUrl         String?  @map("reel_url")
+  thumbnailUrl    String?  @map("thumbnail_url")
+  // The image for a no-video "post" — either the researcher's own uploaded
+  // photo restyled into a social-ready graphic, or (if no photo was
+  // uploaded either) generated from scratch grounded in the attached
+  // reports/datasets. Null whenever this project produced a reel instead.
+  postImageUrl    String?  @map("post_image_url")
+  status          String   @default("draft")
+  errorMessage    String?  @map("error_message")
+  createdBy       String   @map("created_by")
+  creator         User     @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([createdBy, updatedAt])
+  @@map("studio_projects")
+}
+
+// A user's request to access a request_required/restricted dataset, and a
+// staff member's decision on it. Account approval (User.accountStatus) and
+// dataset access approval are deliberately separate workflows — being an
+// active account never implies access to every gated dataset.
+model DatasetAccessRequest {
+  id            String               @id @default(uuid())
+  userId        String               @map("user_id")
+  user          User                 @relation("AccessRequestedBy", fields: [userId], references: [id])
+  contentItemId String               @map("content_item_id")
+  dataset       ContentItem          @relation(fields: [contentItemId], references: [id])
+  status        AccessRequestStatus  @default(pending)
+  reviewedBy    String?              @map("reviewed_by")
+  reviewer      User?                @relation("AccessReviewedBy", fields: [reviewedBy], references: [id])
+  reviewedAt    DateTime?            @map("reviewed_at")
+  createdAt     DateTime             @default(now()) @map("created_at")
+
+  @@unique([userId, contentItemId])
+  @@index([status])
+  @@index([contentItemId])
+  @@map("dataset_access_requests")
+}
